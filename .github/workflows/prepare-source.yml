@@ -1,0 +1,66 @@
+name: Prepare native source
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download and verify public source snapshot
+        run: |
+          python3 - <<'PYDATA'
+          import collections, hashlib, pathlib, urllib.request, xml.etree.ElementTree as ET, zipfile
+          url = "https://samate.nist.gov/SARD/downloads/test-suites/2017-10-01-juliet-test-suite-for-c-cplusplus-v1-3.zip"
+          archive = pathlib.Path("/tmp/source.zip")
+          with urllib.request.urlopen(url, timeout=90) as response, archive.open("wb") as target:
+              while data := response.read(1048576):
+                  target.write(data)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == "ada9d7e1c323d283446df3f55bdee0d00bda1fed786785fe98764d58688f38eb"
+          output = pathlib.Path("/tmp/source-tree")
+          output.mkdir()
+          with zipfile.ZipFile(archive) as z:
+              names = {n for n in z.namelist() if not n.endswith("/")}
+              index = collections.defaultdict(list)
+              for name in names:
+                  if name.startswith("C/testcases/"):
+                      index[pathlib.PurePosixPath(name).name].append(name)
+              cases = []
+              for name in sorted(n for n in names if n.endswith(".xml")):
+                  for case in ET.fromstring(z.read(name)).findall("testcase"):
+                      paths = [f.get("path") for f in case.findall("file")]
+                      if any(p.endswith(".cpp") for p in paths) and all(len(index[p]) == 1 for p in paths):
+                          cases.append([index[p][0] for p in paths])
+              selected = {p for case in cases for p in case}
+              assert len(cases) == 25297 and len(selected) == 50699
+              selected.update(n for n in names if n.startswith("C/testcasesupport/"))
+              assert len(selected) == 50707
+              total = 0
+              for name in sorted(selected):
+                  relative = pathlib.PurePosixPath(name).relative_to("C")
+                  assert ".." not in relative.parts
+                  target = output / str(relative)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  raw = z.read(name)
+                  target.write_bytes(raw)
+                  total += len(raw)
+              assert total == 184664437
+          print("Prepared 25297 complete C++ cases; 50707 source/support files; 184664437 bytes. No dataset code executed.")
+          PYDATA
+      - name: Publish frozen source branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        run: |
+          cd /tmp/source-tree
+          git init --initial-branch=source
+          git config user.name "Fituraio"
+          git config user.email "opensource@users.noreply.github.com"
+          git add .
+          git commit -m "Import verified native source snapshot"
+          git remote add origin "https://github.com/${TARGET_REPOSITORY}.git"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git push origin source
